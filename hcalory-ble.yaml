@@ -1,0 +1,302 @@
+substitutions:
+  device_name: "hcalory-ble"
+  friendly_name: "Hcalory BLE"
+
+  wifi_ssid: "WIFI_SSID"
+  wifi_password: "WIFI_PASSWORD"
+
+  heater_mac: "HEATER_MAC"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
+
+api:
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble: WARN
+    ble_client: INFO
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    interval: 300ms
+    window: 200ms
+
+ble_client:
+  - mac_address: ${heater_mac}
+    id: heater_ble
+    on_connect:
+      then:
+        - logger.log: "BLE connected"
+    on_disconnect:
+      then:
+        - logger.log: "BLE disconnected"
+
+globals:
+  - id: target_gear
+    type: int
+    initial_value: '0'
+
+script:
+  - id: poll_status
+    then:
+      - if:
+          condition:
+            lambda: 'return id(heater_ble).connected();'
+          then:
+            - ble_client.ble_write:
+                id: heater_ble
+                service_uuid: "FFF0"
+                characteristic_uuid: "FFF2"
+                value: [0xBA, 0xAB, 0x04, 0xCC, 0x00, 0x00, 0x00, 0x35]
+          else:
+            - logger.log: "Waiting for BLE connection"
+
+  - id: send_command_frame
+    parameters:
+      cmd: int
+      val1: int
+      val2: int
+    then:
+      - ble_client.ble_write:
+          id: heater_ble
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF2"
+          value: !lambda |-
+            std::vector<uint8_t> frame = {
+              0xAA, 0x55, 0x0C,
+              0x01,
+              (uint8_t)cmd,
+              (uint8_t)val1,
+              (uint8_t)val2,
+              0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+            };
+            uint8_t cs = 0;
+            for (auto b : frame) cs += b;
+            frame.push_back(cs);
+            ESP_LOGI("CMD", "cmd=%d cs=%02X", cmd, cs);
+            return frame;
+
+  - id: send_bb_mode
+    parameters:
+      mode: int
+    then:
+      - ble_client.ble_write:
+          id: heater_ble
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF2"
+          value: !lambda |-
+            std::vector<uint8_t> frame = {
+              0xBA, 0xAB, 0x04, 0xBB,
+              (uint8_t)mode, 0x00, 0x00
+            };
+            uint8_t cs = 0;
+            for (auto b : frame) cs += b;
+            frame.push_back(cs);
+            ESP_LOGI("CMD", "BB mode=%02X cs=%02X", (uint8_t)mode, cs);
+            return frame;
+
+  - id: gear_up
+    then:
+      - ble_client.ble_write:
+          id: heater_ble
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF2"
+          value: [0xBA,0xAB,0x04,0xBB,0xA2,0x00,0x00,0xC6]
+
+  - id: gear_down
+    then:
+      - ble_client.ble_write:
+          id: heater_ble
+          service_uuid: "FFF0"
+          characteristic_uuid: "FFF2"
+          value: [0xBA,0xAB,0x04,0xBB,0xA3,0x00,0x00,0xC7]
+
+  - id: adjust_gear
+    mode: queued
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(heater_gear).has_state()) return false;
+              if (id(heater_status_text).state.rfind("E-", 0) == 0) return false;
+              return true;
+          then:
+            - if:
+                condition:
+                  lambda: 'return (int)id(heater_gear).state < id(target_gear);'
+                then:
+                  - script.execute: gear_up
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return (int)id(heater_gear).state > id(target_gear);'
+                      then:
+                        - script.execute: gear_down
+                      else:
+                        - script.stop: adjust_gear
+            - delay: 1000ms
+            - script.execute: poll_status
+            - delay: 600ms
+            - script.execute: adjust_gear
+
+  - id: heater_power_off
+    mode: restart
+    then:
+      - script.execute:
+          id: send_bb_mode
+          mode: 0xA4
+      - delay: 500ms
+      - script.execute:
+          id: send_bb_mode
+          mode: 0xA1
+      - delay: 500ms
+      - script.execute:
+          id: send_bb_mode
+          mode: 0xA4
+      - delay: 500ms
+
+interval:
+  - interval: 2s
+    then:
+      - script.execute: poll_status
+
+sensor:
+  - platform: template
+    name: "Heater Status Byte"
+    id: heater_status_byte
+    accuracy_decimals: 0
+    internal: true
+
+  - platform: template
+    id: heater_voltage
+    name: "Heater Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+
+  - platform: template
+    name: "Heater Ambient Temp"
+    id: heater_ambient_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+
+  - platform: template
+    id: heater_exchanger_temp
+    name: "Heater Exchanger Temp"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+
+  - platform: template
+    id: heater_error_id
+    name: "Heater Error ID"
+    icon: mdi:alert-circle-outline
+
+  - platform: template
+    id: heater_gear
+    name: "Heater Gear"
+    accuracy_decimals: 0
+    internal: true
+
+  - platform: ble_client
+    type: characteristic
+    name: "Heater Internal Receiver"
+    ble_client_id: heater_ble
+    service_uuid: "FFF0"
+    characteristic_uuid: "FFF1"
+    notify: true
+    internal: true
+    update_interval: never
+    lambda: |-
+      std::string hex;
+      char b[3];
+      for (auto c : x) {
+        sprintf(b, "%02X", c);
+        hex += b;
+      }
+      id(heater_raw).publish_state(hex);
+
+      if (x.size() < 18) return NAN;
+
+      id(heater_voltage).publish_state(x[9]);
+
+      int offset = (x[10] == 0) ? 30 : 22;
+      id(heater_ambient_temp).publish_state((int)x[11] - offset);
+
+      id(heater_exchanger_temp).publish_state((x[12] << 8) | x[13]);
+
+      int mode = x[5];
+      int err = x[6];
+      int gear = x[6];
+      int status = x[4];
+
+      id(heater_status_byte).publish_state(status);
+      id(heater_gear).publish_state(gear);
+      id(heater_gear_select).publish_state(std::to_string(gear));
+
+      if (mode == 0xFF) {
+        id(heater_error_id).publish_state(err);
+        id(heater_status_text).publish_state("E-" + std::to_string(err));
+      } else {
+        id(heater_error_id).publish_state(0);
+        if (status == 0x00) id(heater_status_text).publish_state("OFF");
+        else if (status == 0x01) id(heater_status_text).publish_state("Heating");
+        else if (status == 0x02) id(heater_status_text).publish_state("Cooling");
+        else if (status == 0x04) id(heater_status_text).publish_state("Ventilation");
+        else id(heater_status_text).publish_state("On");
+      }
+      return NAN;
+
+text_sensor:
+  - platform: template
+    name: "Heater Status Text"
+    id: heater_status_text
+    icon: mdi:information-outline
+
+  - platform: template
+    name: "Heater Raw Debug"
+    id: heater_raw
+    icon: mdi:code-tags
+
+switch:
+  - platform: template
+    name: "Heater Power"
+    id: heater_power
+    icon: mdi:power
+    lambda: |-
+      if (!id(heater_status_byte).has_state()) return false;
+      return ((int)id(heater_status_byte).state == 0x01);
+    turn_on_action:
+      - script.execute:
+          id: send_bb_mode
+          mode: 0xA1
+    turn_off_action:
+      - script.execute: heater_power_off
+
+select:
+  - platform: template
+    name: "Heater Power Level"
+    id: heater_gear_select
+    optimistic: false
+    options: ["0","1","2","3","4","5","6"]
+    set_action:
+      then:
+        - lambda: 'id(target_gear) = atoi(x.c_str());'
+        - script.execute: adjust_gear
